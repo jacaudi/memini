@@ -18,6 +18,7 @@ import {
   postSearch,
   readToolCall,
   truncate,
+  writeNamespace,
   DEBUG,
 } from "./_shared.mjs";
 
@@ -40,6 +41,13 @@ async function main() {
 
   const args = payload.tool_input ?? payload.toolArgs ?? {};
   const project = resolveProject(cwd);
+
+  // Re-warm the shared namespace cache for the MCP headersHelper. This hook
+  // fires far more often than SessionStart and carries the real project cwd, so
+  // refreshing here shrinks the last-writer-wins race window when two concurrent
+  // sessions share the single cache file. Best-effort (writeNamespace swallows
+  // its own errors) — never blocks the hook's primary job.
+  writeNamespace(project);
 
   if (DEBUG)
     console.error(`[memini] PreToolUse tool=${toolName} project=${project} session=${sessionId}`);

@@ -612,6 +612,140 @@ test("mcp-headers.mjs: uses the cached namespace when CLAUDE_PROJECT_DIR is unse
   assert.equal(h.Authorization, "Bearer tok-123");
 });
 
+// The tool hooks fire far more often than SessionStart, and they receive the
+// real project cwd on stdin. Re-warming the shared namespace cache from them
+// shrinks the last-writer-wins race window when two concurrent sessions in
+// different projects share the single cache file (see
+// docs/findings/mcp-namespace-concurrent-sessions.md).
+
+test("pre-tool-use.mjs: re-warms the namespace cache from the payload cwd", async () => {
+  const { readFileSync } = await import("node:fs");
+  const cache = freshCache();
+  // pre-tool-use POSTs to memini; give it a mock so the network call resolves
+  // fast. The cache write is the assertion, independent of the POST outcome.
+  const { url, close } = await startMockServer((req, res) => {
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ results: [] }));
+  });
+  try {
+    await runHook(
+      "pre-tool-use.mjs",
+      JSON.stringify({
+        session_id: "rw1",
+        cwd: __dirname, // the memini repo → "memini"
+        tool_name: "Read",
+        tool_input: { file_path: "internal/auth.go" },
+      }),
+      { MEMINI_URL: url, XDG_CACHE_HOME: cache },
+    );
+    const ns = readFileSync(join(cache, "memini", "namespace"), "utf8").trim();
+    assert.equal(ns, "memini", "PreToolUse should cache the payload cwd's namespace");
+  } finally {
+    await close();
+  }
+});
+
+test("post-tool-use.mjs: re-warms the namespace cache from the payload cwd", async () => {
+  const { readFileSync } = await import("node:fs");
+  const cache = freshCache();
+  // Every matched tool call re-warms the cache (after payload validation), so
+  // a concurrent session's overwrite is corrected on the next tool call. Bash
+  // is a realistic matched tool — the PostToolUse matcher has no read-only
+  // tools. With an empty project map this exercises the full-resolution
+  // fallback path.
+  await runHook(
+    "post-tool-use.mjs",
+    JSON.stringify({
+      session_id: "rw2",
+      cwd: __dirname, // the memini repo → "memini"
+      tool_name: "Bash",
+      tool_input: { command: "git status" },
+    }),
+    { XDG_CACHE_HOME: cache },
+  );
+  const ns = readFileSync(join(cache, "memini", "namespace"), "utf8").trim();
+  assert.equal(ns, "memini", "PostToolUse should cache the payload cwd's namespace");
+});
+
+test("post-tool-use.mjs: a payload with no tool_name does not touch the namespace cache", async () => {
+  const { existsSync } = await import("node:fs");
+  const cache = freshCache();
+  await runHook(
+    "post-tool-use.mjs",
+    JSON.stringify({ session_id: "rw3", cwd: __dirname, tool_input: { command: "ls" } }),
+    { XDG_CACHE_HOME: cache },
+  );
+  assert.equal(
+    existsSync(join(cache, "memini", "namespace")),
+    false,
+    "an unvalidated payload must not trigger a cache write",
+  );
+});
+
+test("post-tool-use.mjs: re-warm takes the project-map fast path when it has the cwd", async () => {
+  const { readFileSync, mkdirSync, rmSync } = await import("node:fs");
+  const cache = freshCache();
+  const dir = mkdtempSync(join(tmpdir(), "memini-fastpath-"));
+  try {
+    // Seed the project map with a name full resolution cannot produce: `dir`
+    // is not a git repo, so resolveProject(dir) would yield basename(dir).
+    // Seeing "mapped-ns" in the cache proves the map fast path was taken
+    // (zero git subprocess spawns).
+    mkdirSync(join(cache, "memini"), { recursive: true });
+    writeFileSync(
+      join(cache, "memini", "project-map.json"),
+      JSON.stringify({ ["path:" + dir]: "mapped-ns" }),
+    );
+    await runHook(
+      "post-tool-use.mjs",
+      JSON.stringify({ session_id: "fp1", cwd: dir, tool_name: "Bash", tool_input: { command: "ls" } }),
+      { XDG_CACHE_HOME: cache },
+    );
+    const ns = readFileSync(join(cache, "memini", "namespace"), "utf8").trim();
+    assert.equal(ns, "mapped-ns", "the mapped namespace must be used, not re-derived from git");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveProjectCached: cached-hit resolutions backfill the path key so worktrees hit the fast path", async () => {
+  const { execSync } = await import("node:child_process");
+  const { mkdtempSync, rmSync, realpathSync } = await import("node:fs");
+  // realpath: git rev-parse --show-toplevel resolves symlinks (macOS tmpdir is
+  // /var -> /private/var), and the map is keyed by what git returns.
+  const dirA = realpathSync(mkdtempSync(join(tmpdir(), "memini-test-")));
+  const dirB = realpathSync(mkdtempSync(join(tmpdir(), "memini-test-")));
+  const prevCache = process.env["XDG_CACHE_HOME"];
+  const prevNs = process.env["MEMINI_NAMESPACE"];
+  process.env["XDG_CACHE_HOME"] = mkdtempSync(join(tmpdir(), "memini-cache-"));
+  try {
+    for (const d of [dirA, dirB]) {
+      execSync("git init -q", { cwd: d });
+      execSync("git remote add origin https://github.com/acme/widget.git", { cwd: d });
+    }
+    const { resolveProject, resolveProjectCached } = await import("./_shared.mjs?cb=" + Date.now());
+    // A derives "widget" and records it under the remote + path:dirA keys.
+    assert.equal(resolveProject(dirA), "widget");
+    // B (same remote — a second checkout, like a worktree) hits the remote key;
+    // without backfill its toplevel would never be recorded and the fast path
+    // would miss forever.
+    assert.equal(resolveProject(dirB), "widget");
+    assert.equal(resolveProjectCached(dirB), "widget", "path:dirB must be backfilled on the cached hit");
+    // A miss returns null so callers can fall back to full resolution.
+    assert.equal(resolveProjectCached(dirB + "-nonexistent"), null);
+    // The env override outranks the map, matching resolveProject.
+    process.env["MEMINI_NAMESPACE"] = "forced-ns";
+    assert.equal(resolveProjectCached(dirB), "forced-ns");
+  } finally {
+    if (prevCache === undefined) delete process.env["XDG_CACHE_HOME"];
+    else process.env["XDG_CACHE_HOME"] = prevCache;
+    if (prevNs === undefined) delete process.env["MEMINI_NAMESPACE"];
+    else process.env["MEMINI_NAMESPACE"] = prevNs;
+    rmSync(dirA, { recursive: true, force: true });
+    rmSync(dirB, { recursive: true, force: true });
+  }
+});
+
 test("mcp-headers.mjs: CLAUDE_PROJECT_DIR stays authoritative over the cache", async () => {
   const { mkdirSync } = await import("node:fs");
   const cache = mkdtempSync(join(tmpdir(), "memini-cache-"));

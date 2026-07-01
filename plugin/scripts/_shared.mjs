@@ -66,6 +66,22 @@ export function resolveProject(cwd) {
   return withAgent(resolveProjectBase(cwd));
 }
 
+/**
+ * Resolve the project namespace from the project map alone — a pure file read,
+ * zero git subprocess spawns — for hot paths like PostToolUse that fire on
+ * nearly every tool call. Hits when `cwd` is a git toplevel some prior full
+ * resolution recorded (sessions launched at a repo/worktree root — the common
+ * case; SessionStart's resolveProject records or backfills the key). Returns
+ * null on a miss so callers can fall back to resolveProject. Never throws.
+ */
+export function resolveProjectCached(cwd) {
+  const nsEnv = process.env["MEMINI_NAMESPACE"];
+  if (nsEnv && nsEnv.trim()) return withAgent(nsEnv.trim());
+  const dir = cwd && cwd.trim() ? cwd : process.cwd();
+  const ns = readProjectMap()["path:" + dir];
+  return typeof ns === "string" && ns ? withAgent(ns) : null;
+}
+
 // withAgent nests the project namespace under a per-agent segment when
 // MEMINI_AGENT is set ("myproject" -> "myproject/reviewer"), so several agents
 // sharing a repo keep private memory. Recall with scope=subtree on the project
@@ -113,7 +129,17 @@ function resolveProjectBase(cwd) {
   const pathKey = toplevel ? "path:" + toplevel : null;
   const map = readProjectMap();
   const cached = (remoteKey && map[remoteKey]) || (pathKey && map[pathKey]);
-  if (cached) return cached;
+  if (cached) {
+    // Backfill whichever stable key is missing: a new worktree or moved
+    // checkout resolves via the remote key, but its toplevel was never
+    // recorded, so resolveProjectCached would miss for it forever. One write
+    // here and the zero-subprocess fast path hits from then on.
+    const missing = {};
+    if (remoteKey && !map[remoteKey]) missing[remoteKey] = cached;
+    if (pathKey && !map[pathKey]) missing[pathKey] = cached;
+    if (Object.keys(missing).length) writeProjectMap({ ...map, ...missing });
+    return cached;
+  }
 
   // Derive a fresh namespace. owner-repo disambiguates same-named repos across
   // owners; the default keeps the bare repo name for backward compatibility.
