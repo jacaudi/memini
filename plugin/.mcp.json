@@ -4,7 +4,7 @@
     "memini": {
       "type": "http",
       "url": "${MEMINI_MCP_URL:-http://localhost:8080/mcp}",
-      "headersHelper": "R=$(cat \"${XDG_CACHE_HOME:-$HOME/.cache}/memini/plugin-root\" 2>/dev/null); if [ -n \"$R\" ] && [ -f \"$R/scripts/mcp-headers.mjs\" ]; then exec node \"$R/scripts/mcp-headers.mjs\"; fi; t=\"${MEMINI_TOKEN:-$MEMINI_API_KEY}\"; if [ -n \"$t\" ]; then printf '{\"Authorization\":\"Bearer %s\"}' \"$t\"; else printf '{}'; fi"
+      "headersHelper": "R=$(cat \"${XDG_CACHE_HOME:-$HOME/.cache}/memini/plugin-root\" 2>/dev/null); if [ -n \"$R\" ] && [ -f \"$R/scripts/mcp-headers.mjs\" ]; then exec node \"$R/scripts/mcp-headers.mjs\"; fi; N=$(cat \"${XDG_CACHE_HOME:-$HOME/.cache}/memini/namespace\" 2>/dev/null); t=\"${MEMINI_TOKEN:-$MEMINI_API_KEY}\"; printf '{'; s=''; [ -n \"$t\" ] && { printf '\"Authorization\":\"Bearer %s\"' \"$t\"; s=','; }; [ -n \"$N\" ] && printf '%s\"X-Memini-Namespace\":\"%s\"' \"$s\" \"$N\"; printf '}'"
     }
   }
 }

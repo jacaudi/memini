@@ -570,3 +570,57 @@ test("mcp-headers.mjs: omits Authorization when no token", async () => {
   assert.equal(h["X-Memini-Namespace"], "memini");
   assert.equal(h.Authorization, undefined);
 });
+
+// --- namespace cache (headersHelper fix) ---------------------------------
+//
+// The MCP headersHelper runs in a bare shell WITHOUT CLAUDE_PROJECT_DIR and
+// with cwd = the plugin install dir (…/memini/<version>), which is not a git
+// repo, so resolveProject(cwd) returns the plugin VERSION and collapses every
+// project into one catch-all. SessionStart caches the resolved namespace; the
+// headersHelper prefers CLAUDE_PROJECT_DIR -> cached namespace -> cwd.
+
+test("resolveProject: a plugin install dir resolves to the version dir (the trap)", async () => {
+  const { resolveProject } = await import("./_shared.mjs?cb=" + Date.now());
+  assert.equal(resolveProject("/x/.claude/plugins/cache/memini/memini/0.3.7"), "0.3.7");
+});
+
+test("writeNamespace/readNamespace round-trip via the namespace cache file", async () => {
+  const prevCache = process.env["XDG_CACHE_HOME"];
+  process.env["XDG_CACHE_HOME"] = mkdtempSync(join(tmpdir(), "memini-cache-"));
+  try {
+    const { writeNamespace, readNamespace } = await import("./_shared.mjs?cb=" + Date.now());
+    writeNamespace("oci-artifacts");
+    assert.equal(readNamespace(), "oci-artifacts");
+  } finally {
+    if (prevCache === undefined) delete process.env["XDG_CACHE_HOME"];
+    else process.env["XDG_CACHE_HOME"] = prevCache;
+  }
+});
+
+test("mcp-headers.mjs: uses the cached namespace when CLAUDE_PROJECT_DIR is unset", async () => {
+  const { mkdirSync } = await import("node:fs");
+  const cache = mkdtempSync(join(tmpdir(), "memini-cache-"));
+  mkdirSync(join(cache, "memini"), { recursive: true });
+  writeFileSync(join(cache, "memini", "namespace"), "oci-artifacts");
+  const { stdout } = await runHook("mcp-headers.mjs", "", {
+    CLAUDE_PROJECT_DIR: "",
+    XDG_CACHE_HOME: cache,
+    MEMINI_TOKEN: "tok-123",
+  });
+  const h = JSON.parse(stdout);
+  assert.equal(h["X-Memini-Namespace"], "oci-artifacts", "must use cached namespace, not cwd basename");
+  assert.equal(h.Authorization, "Bearer tok-123");
+});
+
+test("mcp-headers.mjs: CLAUDE_PROJECT_DIR stays authoritative over the cache", async () => {
+  const { mkdirSync } = await import("node:fs");
+  const cache = mkdtempSync(join(tmpdir(), "memini-cache-"));
+  mkdirSync(join(cache, "memini"), { recursive: true });
+  writeFileSync(join(cache, "memini", "namespace"), "cached-other");
+  const { stdout } = await runHook("mcp-headers.mjs", "", {
+    CLAUDE_PROJECT_DIR: __dirname, // the memini repo → "memini"
+    XDG_CACHE_HOME: cache,
+  });
+  const h = JSON.parse(stdout);
+  assert.equal(h["X-Memini-Namespace"], "memini", "CLAUDE_PROJECT_DIR must win over the cache");
+});

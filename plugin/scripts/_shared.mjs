@@ -344,6 +344,35 @@ export function writePluginRoot() {
   }
 }
 
+/** Path of the cached resolved namespace (written by SessionStart, read by the
+ *  MCP headersHelper, which has no CLAUDE_PROJECT_DIR and a wrong cwd). */
+export function namespaceFile() {
+  return join(meminiCacheDir(), "namespace");
+}
+
+/** Persist the project namespace the hooks resolved, so the headersHelper can
+ *  reuse it instead of deriving the plugin-version dir. Best-effort. */
+export function writeNamespace(ns) {
+  const t = String(ns).trim();
+  if (!t) return;
+  try {
+    fs.mkdirSync(meminiCacheDir(), { recursive: true });
+    fs.writeFileSync(namespaceFile(), t);
+  } catch (e) {
+    if (DEBUG) console.error("[memini] writeNamespace failed:", e?.message || e);
+  }
+}
+
+/** Read the cached namespace (null on any error/empty). */
+export function readNamespace() {
+  try {
+    const ns = fs.readFileSync(namespaceFile(), "utf8").trim();
+    return ns || null;
+  } catch {
+    return null;
+  }
+}
+
 /** Sanitize a session id into a safe filename component. */
 function safeId(sessionId) {
   return String(sessionId || "unknown").replace(/[^a-zA-Z0-9._-]/g, "_");

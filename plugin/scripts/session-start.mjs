@@ -18,6 +18,7 @@ import {
   getBriefing,
   cleanStaleBuffers,
   writePluginRoot,
+  writeNamespace,
   DEBUG,
 } from "./_shared.mjs";
 
@@ -43,6 +44,9 @@ async function main() {
   const sessionId = payload.session_id || payload.sessionId;
   const cwd = payload.cwd || process.cwd();
   const project = resolveProject(cwd);
+  // Cache the resolved namespace for the MCP headersHelper, which has no
+  // CLAUDE_PROJECT_DIR and a cwd of the plugin install dir (see mcp-headers.mjs).
+  writeNamespace(project);
 
   // Hygiene: drop session buffers left behind by sessions that never ended.
   cleanStaleBuffers(STALE_BUFFER_MS);
